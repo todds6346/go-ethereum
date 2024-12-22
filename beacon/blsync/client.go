@@ -17,57 +17,44 @@
 package blsync
 
 import (
-	"strings"
-
 	"github.com/ethereum/go-ethereum/beacon/light"
 	"github.com/ethereum/go-ethereum/beacon/light/api"
 	"github.com/ethereum/go-ethereum/beacon/light/request"
 	"github.com/ethereum/go-ethereum/beacon/light/sync"
+	"github.com/ethereum/go-ethereum/beacon/params"
 	"github.com/ethereum/go-ethereum/beacon/types"
-	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/event"
-	"github.com/urfave/cli/v2"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 type Client struct {
-	scheduler     *request.Scheduler
-	chainHeadFeed *event.Feed
-	urls          []string
-	customHeader  map[string]string
+	urls         []string
+	customHeader map[string]string
+	config       *params.ClientConfig
+	scheduler    *request.Scheduler
+	blockSync    *beaconBlockSync
+	engineRPC    *rpc.Client
+
+	chainHeadSub event.Subscription
+	engineClient *engineClient
 }
 
-func NewClient(ctx *cli.Context) *Client {
-	if !ctx.IsSet(utils.BeaconApiFlag.Name) {
-		utils.Fatalf("Beacon node light client API URL not specified")
-	}
-	var (
-		chainConfig  = makeChainConfig(ctx)
-		customHeader = make(map[string]string)
-	)
-	for _, s := range ctx.StringSlice(utils.BeaconApiHeaderFlag.Name) {
-		kv := strings.Split(s, ":")
-		if len(kv) != 2 {
-			utils.Fatalf("Invalid custom API header entry: %s", s)
-		}
-		customHeader[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-	}
+func NewClient(config params.ClientConfig) *Client {
 	// create data structures
 	var (
 		db             = memorydb.New()
-		threshold      = ctx.Int(utils.BeaconThresholdFlag.Name)
-		committeeChain = light.NewCommitteeChain(db, chainConfig.ChainConfig, threshold, !ctx.Bool(utils.BeaconNoFilterFlag.Name))
-		headTracker    = light.NewHeadTracker(committeeChain, threshold)
+		committeeChain = light.NewCommitteeChain(db, &config.ChainConfig, config.Threshold, !config.NoFilter)
+		headTracker    = light.NewHeadTracker(committeeChain, config.Threshold)
 	)
 	headSync := sync.NewHeadSync(headTracker, committeeChain)
 
 	// set up scheduler and sync modules
-	chainHeadFeed := new(event.Feed)
 	scheduler := request.NewScheduler()
-	checkpointInit := sync.NewCheckpointInit(committeeChain, chainConfig.Checkpoint)
+	checkpointInit := sync.NewCheckpointInit(committeeChain, config.Checkpoint)
 	forwardSync := sync.NewForwardUpdateSync(committeeChain)
-	beaconBlockSync := newBeaconBlockSync(headTracker, chainHeadFeed)
+	beaconBlockSync := newBeaconBlockSync(headTracker)
 	scheduler.RegisterTarget(headTracker)
 	scheduler.RegisterTarget(committeeChain)
 	scheduler.RegisterModule(checkpointInit, "checkpointInit")
@@ -76,28 +63,34 @@ func NewClient(ctx *cli.Context) *Client {
 	scheduler.RegisterModule(beaconBlockSync, "beaconBlockSync")
 
 	return &Client{
-		scheduler:     scheduler,
-		urls:          ctx.StringSlice(utils.BeaconApiFlag.Name),
-		customHeader:  customHeader,
-		chainHeadFeed: chainHeadFeed,
+		scheduler:    scheduler,
+		urls:         config.Apis,
+		customHeader: config.CustomHeader,
+		config:       &config,
+		blockSync:    beaconBlockSync,
 	}
 }
 
-// SubscribeChainHeadEvent allows callers to subscribe a provided channel to new
-// head updates.
-func (c *Client) SubscribeChainHeadEvent(ch chan<- types.ChainHeadEvent) event.Subscription {
-	return c.chainHeadFeed.Subscribe(ch)
+func (c *Client) SetEngineRPC(engine *rpc.Client) {
+	c.engineRPC = engine
 }
 
-func (c *Client) Start() {
+func (c *Client) Start() error {
+	headCh := make(chan types.ChainHeadEvent, 16)
+	c.chainHeadSub = c.blockSync.SubscribeChainHead(headCh)
+	c.engineClient = startEngineClient(c.config, c.engineRPC, headCh)
+
 	c.scheduler.Start()
-	// register server(s)
 	for _, url := range c.urls {
 		beaconApi := api.NewBeaconLightApi(url, c.customHeader)
 		c.scheduler.RegisterServer(request.NewServer(api.NewApiServer(beaconApi), &mclock.System{}))
 	}
+	return nil
 }
 
-func (c *Client) Stop() {
+func (c *Client) Stop() error {
+	c.engineClient.stop()
+	c.chainHeadSub.Unsubscribe()
 	c.scheduler.Stop()
+	return nil
 }

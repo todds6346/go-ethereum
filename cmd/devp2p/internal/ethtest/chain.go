@@ -27,6 +27,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -40,7 +41,6 @@ import (
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"golang.org/x/exp/slices"
 )
 
 // Chain is a lightweight blockchain-like store which can read a hivechain
@@ -100,7 +100,6 @@ func (c *Chain) AccountsInHashOrder() []state.DumpAccount {
 	list := make([]state.DumpAccount, len(c.state))
 	i := 0
 	for addr, acc := range c.state {
-		addr := addr
 		list[i] = acc
 		list[i].Address = &addr
 		if len(acc.AddressHash) != 32 {

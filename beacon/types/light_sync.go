@@ -20,12 +20,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/beacon/merkle"
 	"github.com/ethereum/go-ethereum/beacon/params"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/protolambda/zrnt/eth2/beacon/capella"
-	"github.com/protolambda/ztyp/tree"
+	ctypes "github.com/ethereum/go-ethereum/core/types"
 )
 
 // HeadInfo represents an unvalidated new head announcement.
@@ -144,17 +142,57 @@ func (u UpdateScore) BetterThan(w UpdateScore) bool {
 	return u.SignerCount > w.SignerCount
 }
 
+// HeaderWithExecProof contains a beacon header and proves the belonging execution
+// payload header with a Merkle proof.
 type HeaderWithExecProof struct {
 	Header
-	PayloadHeader *capella.ExecutionPayloadHeader
+	PayloadHeader *ExecutionHeader
 	PayloadBranch merkle.Values
 }
 
+// Validate verifies the Merkle proof of the execution payload header.
 func (h *HeaderWithExecProof) Validate() error {
-	payloadRoot := merkle.Value(h.PayloadHeader.HashTreeRoot(tree.GetHashFn()))
-	return merkle.VerifyProof(h.BodyRoot, params.BodyIndexExecPayload, h.PayloadBranch, payloadRoot)
+	return merkle.VerifyProof(h.BodyRoot, params.BodyIndexExecPayload, h.PayloadBranch, h.PayloadHeader.PayloadRoot())
 }
 
+// OptimisticUpdate proves sync committee commitment on the attested beacon header.
+// It also proves the belonging execution payload header with a Merkle proof.
+//
+// See data structure definition here:
+// https://github.com/ethereum/consensus-specs/blob/dev/specs/altair/light-client/sync-protocol.md#lightclientoptimisticupdate
+type OptimisticUpdate struct {
+	Attested HeaderWithExecProof
+	// Sync committee BLS signature aggregate
+	Signature SyncAggregate
+	// Slot in which the signature has been created (newer than Header.Slot,
+	// determines the signing sync committee)
+	SignatureSlot uint64
+}
+
+// SignedHeader returns the signed attested header of the update.
+func (u *OptimisticUpdate) SignedHeader() SignedHeader {
+	return SignedHeader{
+		Header:        u.Attested.Header,
+		Signature:     u.Signature,
+		SignatureSlot: u.SignatureSlot,
+	}
+}
+
+// Validate verifies the Merkle proof proving the execution payload header.
+// Note that the sync committee signature of the attested header should be
+// verified separately by a synced committee chain.
+func (u *OptimisticUpdate) Validate() error {
+	return u.Attested.Validate()
+}
+
+// FinalityUpdate proves a finalized beacon header by a sync committee commitment
+// on an attested beacon header, referring to the latest finalized header with a
+// Merkle proof.
+// It also proves the execution payload header belonging to both the attested and
+// the finalized beacon header with Merkle proofs.
+//
+// See data structure definition here:
+// https://github.com/ethereum/consensus-specs/blob/dev/specs/altair/light-client/sync-protocol.md#lightclientfinalityupdate
 type FinalityUpdate struct {
 	Attested, Finalized HeaderWithExecProof
 	FinalityBranch      merkle.Values
@@ -165,6 +203,7 @@ type FinalityUpdate struct {
 	SignatureSlot uint64
 }
 
+// SignedHeader returns the signed attested header of the update.
 func (u *FinalityUpdate) SignedHeader() SignedHeader {
 	return SignedHeader{
 		Header:        u.Attested.Header,
@@ -173,6 +212,10 @@ func (u *FinalityUpdate) SignedHeader() SignedHeader {
 	}
 }
 
+// Validate verifies the Merkle proofs proving the finalized beacon header and
+// the execution payload headers belonging to the attested and finalized headers.
+// Note that the sync committee signature of the attested header should be
+// verified separately by a synced committee chain.
 func (u *FinalityUpdate) Validate() error {
 	if err := u.Attested.Validate(); err != nil {
 		return err
@@ -187,6 +230,7 @@ func (u *FinalityUpdate) Validate() error {
 // latest accepted head of the beacon chain, along with the hash of the latest
 // finalized execution block.
 type ChainHeadEvent struct {
-	HeadBlock *engine.ExecutableData
-	Finalized common.Hash
+	BeaconHead Header
+	Block      *ctypes.Block
+	Finalized  common.Hash
 }
